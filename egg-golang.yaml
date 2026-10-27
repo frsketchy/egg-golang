@@ -73,7 +73,14 @@ scripts:
       [[ "$pull_on_startup" == 0 || "$pull_on_startup" == 1 ]] || fail 'PULL_ON_STARTUP must be 0 or 1.'
 
       if [[ "$pull_on_startup" == 1 && -n "${GITHUB_REPO:-}" ]]; then
-          repository="$(normalize_repository "$GITHUB_REPO")" || fail 'GITHUB_REPO must be owner/repo or a GitHub HTTPS URL.'
+          source="${GITHUB_REPO%/}"
+          repository="$(normalize_repository "${source%%/tree/*}")" || fail 'GITHUB_REPO must be owner/repo or a GitHub HTTPS URL.'
+          branch_args=(); clone_args=()
+          if [[ "$source" == */tree/* ]]; then
+              branch="${source#*/tree/}"
+              git check-ref-format --branch "$branch" >/dev/null || fail 'Invalid Git branch.'
+              branch_args=("$branch"); clone_args=(--branch "$branch")
+          fi
           repository_url="https://github.com/${repository}.git"
           export GIT_TERMINAL_PROMPT=0 LC_ALL=C GIT_ASKPASS="${BASH_SOURCE[0]%/*}/git-askpass.sh"
           if [[ -e .git ]]; then
@@ -83,8 +90,12 @@ scripts:
                   || fail 'The origin remote must be a GitHub HTTPS URL without credentials.'
               [[ "${origin_repository,,}" == "${repository,,}" ]] || fail 'GITHUB_REPO differs from origin.'
               git symbolic-ref --quiet HEAD >/dev/null || fail 'Cannot pull a detached HEAD.'
+              if [[ ${#branch_args[@]} != 0 ]]; then
+                  git -c credential.helper= fetch origin "refs/heads/$branch:refs/remotes/origin/$branch"
+                  git switch -- "$branch"
+              fi
               printf '[golang] Pulling repository (fast-forward only)...\n'
-              git -c credential.helper= pull --ff-only --no-rebase origin
+              git -c credential.helper= pull --ff-only --no-rebase origin "${branch_args[@]}"
           else
               [[ -z "$(find . -mindepth 1 -maxdepth 1 ! -name .pelican -print -quit)" ]] \
                   || fail 'Initial clone requires an empty server files root (apart from .pelican).'
@@ -92,7 +103,7 @@ scripts:
               clone_directory="$(mktemp -d "$root/.pelican/clone.XXXXXX")"
               trap 'rm -rf -- "$clone_directory"' EXIT
               printf '[golang] Cloning repository...\n'
-              git -c credential.helper= clone -- "$repository_url" "$clone_directory"
+              git -c credential.helper= clone "${clone_args[@]}" -- "$repository_url" "$clone_directory"
               [[ ! -e "$clone_directory/.pelican" && ! -L "$clone_directory/.pelican" ]] \
                   || fail 'Repository must not contain .pelican (reserved for Go).'
               shopt -s dotglob
@@ -142,12 +153,12 @@ variables:
     rules: [required, string, 'max:255']
   - sort: 3
     name: GitHub repository
-    description: 'Optional owner/repo or HTTPS GitHub URL. First clone needs an empty server root except .pelican.'
+    description: 'Optional owner/repo or GitHub URL; /tree/branch selects a branch. First clone needs an empty root except .pelican.'
     env_variable: GITHUB_REPO
     default_value: ''
     user_viewable: true
     user_editable: true
-    rules: [nullable, string, 'max:255', 'regex:~^(https://github\.com/)?[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+/?$~']
+    rules: [nullable, string, 'max:255', 'regex:~^(https://github\.com/)?[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+(/tree/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*)?/?$~']
   - sort: 4
     name: GitHub token
     description: Optional read-only PAT for private repositories. Admin-only field; not isolated from server code.
