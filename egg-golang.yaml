@@ -9,7 +9,72 @@ docker_images:
   Debian: ghcr.io/pelican-eggs/yolks:debian
 file_denylist: []
 startup_commands:
-  Default: 'exec bash /home/container/.pelican/start.sh'
+  Default: >-
+    set -euo pipefail;
+    fail() { echo "[golang] ERROR: $*" >&2; exit 1; };
+    normalize_repository() {
+        local repository="${1#https://github.com/}";
+        repository="${repository%/}";
+        repository="${repository%.git}";
+        [[ "$repository" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ ]] || return 1;
+        echo "$repository";
+    };
+    cd "${HOME:-/home/container}";
+    root="$(pwd -P)";
+    executable="${EXECUTABLE:-}";
+    package="${GO_PACKAGE:-}";
+    pull_on_startup="${PULL_ON_STARTUP:-0}";
+    export PATH="$root/.pelican/go/bin:$PATH";
+    [[ "$executable" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail 'Invalid EXECUTABLE filename.';
+    [[ -n "$package" && "${package:0:1}" != / ]] || fail 'GO_PACKAGE must be relative to the server files root.';
+    [[ "$pull_on_startup" == 0 || "$pull_on_startup" == 1 ]] || fail 'PULL_ON_STARTUP must be 0 or 1.';
+    if [[ "$pull_on_startup" == 1 && -n "${GITHUB_REPO:-}" ]]; then
+        repository="$(normalize_repository "$GITHUB_REPO")" || fail 'GITHUB_REPO must be owner/repo or a GitHub HTTPS URL.';
+        repository_url="https://github.com/${repository}.git";
+        export GIT_TERMINAL_PROMPT=0 LC_ALL=C GIT_ASKPASS="$root/.pelican/git-askpass.sh";
+        if [[ -e .git ]]; then
+            [[ "$(git rev-parse --show-toplevel)" == "$root" ]] || fail 'Git working tree must be rooted here.';
+            origin="$(git remote get-url origin)";
+            [[ "$origin" == https://github.com/* ]] && origin_repository="$(normalize_repository "$origin")" ||
+                fail 'The origin remote must be a GitHub HTTPS URL without credentials.';
+            [[ "${origin_repository,,}" == "${repository,,}" ]] || fail 'GITHUB_REPO differs from origin.';
+            git symbolic-ref --quiet HEAD >/dev/null || fail 'Cannot pull a detached HEAD.';
+            echo '[golang] Pulling repository (fast-forward only)...';
+            git -c credential.helper= pull --ff-only --no-rebase origin;
+        else
+            [[ -z "$(find . -mindepth 1 -maxdepth 1 ! -name .pelican -print -quit)" ]] ||
+                fail 'Initial clone requires an empty server files root (apart from .pelican).';
+            mkdir -p "$root/.pelican";
+            clone_directory="$(mktemp -d "$root/.pelican/clone.XXXXXX")";
+            trap 'rm -rf -- "$clone_directory"' EXIT;
+            echo '[golang] Cloning repository...';
+            git -c credential.helper= clone -- "$repository_url" "$clone_directory";
+            [[ ! -e "$clone_directory/.pelican" && ! -L "$clone_directory/.pelican" ]] ||
+                fail 'Repository must not contain .pelican (reserved for Go).';
+            shopt -s dotglob;
+            mv -- "$clone_directory"/* "$root/";
+            rmdir "$clone_directory";
+            trap - EXIT;
+        fi;
+    fi;
+    unset GITHUB_TOKEN GIT_ASKPASS GIT_TERMINAL_PROMPT STARTUP;
+    [[ -d "$root/$package" ]] || fail 'GO_PACKAGE does not exist or is not a directory.';
+    package_directory="$(cd "$root/$package" && pwd -P)";
+    [[ "$package_directory" == "$root" || "$package_directory" == "$root/"* ]] || fail 'GO_PACKAGE must resolve inside the server root.';
+    [[ ! -d "$root/$executable" ]] || fail 'EXECUTABLE conflicts with an existing directory.';
+    export GOPATH="$root/.cache/go" GOCACHE="$root/.cache/go-build";
+    mkdir -p "$GOPATH" "$GOCACHE";
+    go version;
+    echo "[golang] Building $package -> $executable...";
+    build_directory="$(mktemp -d "$root/.go-build.XXXXXX")";
+    trap 'rm -rf -- "$build_directory"' EXIT;
+    (cd "$package_directory"; GOTMPDIR="$build_directory" TMPDIR="$build_directory" go build -o "$build_directory/app" .);
+    [[ -f "$build_directory/app" && -x "$build_directory/app" ]] || fail 'GO_PACKAGE must build an executable main package.';
+    mv -fT -- "$build_directory/app" "$root/$executable";
+    rmdir "$build_directory";
+    trap - EXIT;
+    echo '[golang] Launching application';
+    exec "$root/$executable"
 config:
   files: {}
   startup: {done: '[golang] Launching application'}
@@ -51,77 +116,7 @@ scripts:
           *) exit 1 ;;
       esac
       ASKPASS_SH
-      cat > "$tools/start.sh" <<'START_SH'
-      #!/bin/bash
-      set -euo pipefail
-      fail() { printf '[golang] ERROR: %s\n' "$*" >&2; exit 1; }
-      normalize_repository() {
-          local repository="${1#https://github.com/}"
-          repository="${repository%/}"
-          repository="${repository%.git}"
-          [[ "$repository" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ ]] || return 1
-          printf '%s\n' "$repository"
-      }
-      cd "${HOME:-/home/container}"
-      root="$(pwd -P)"
-      executable="${EXECUTABLE:-}"
-      package="${GO_PACKAGE:-}"
-      pull_on_startup="${PULL_ON_STARTUP:-0}"
-      export PATH="$root/.pelican/go/bin:$PATH"
-      [[ "$executable" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail 'Invalid EXECUTABLE filename.'
-      [[ -n "$package" && "$package" != /* ]] || fail 'GO_PACKAGE must be relative to the server files root.'
-      [[ "$pull_on_startup" == 0 || "$pull_on_startup" == 1 ]] || fail 'PULL_ON_STARTUP must be 0 or 1.'
-
-      if [[ "$pull_on_startup" == 1 && -n "${GITHUB_REPO:-}" ]]; then
-          repository="$(normalize_repository "$GITHUB_REPO")" || fail 'GITHUB_REPO must be owner/repo or a GitHub HTTPS URL.'
-          repository_url="https://github.com/${repository}.git"
-          export GIT_TERMINAL_PROMPT=0 LC_ALL=C GIT_ASKPASS="${BASH_SOURCE[0]%/*}/git-askpass.sh"
-          if [[ -e .git ]]; then
-              [[ "$(git rev-parse --show-toplevel)" == "$root" ]] || fail 'Git working tree must be rooted here.'
-              origin="$(git remote get-url origin)"
-              [[ "$origin" == https://github.com/* ]] && origin_repository="$(normalize_repository "$origin")" \
-                  || fail 'The origin remote must be a GitHub HTTPS URL without credentials.'
-              [[ "${origin_repository,,}" == "${repository,,}" ]] || fail 'GITHUB_REPO differs from origin.'
-              git symbolic-ref --quiet HEAD >/dev/null || fail 'Cannot pull a detached HEAD.'
-              printf '[golang] Pulling repository (fast-forward only)...\n'
-              git -c credential.helper= pull --ff-only --no-rebase origin
-          else
-              [[ -z "$(find . -mindepth 1 -maxdepth 1 ! -name .pelican -print -quit)" ]] \
-                  || fail 'Initial clone requires an empty server files root (apart from .pelican).'
-              mkdir -p "$root/.pelican"
-              clone_directory="$(mktemp -d "$root/.pelican/clone.XXXXXX")"
-              trap 'rm -rf -- "$clone_directory"' EXIT
-              printf '[golang] Cloning repository...\n'
-              git -c credential.helper= clone -- "$repository_url" "$clone_directory"
-              [[ ! -e "$clone_directory/.pelican" && ! -L "$clone_directory/.pelican" ]] \
-                  || fail 'Repository must not contain .pelican (reserved for Go).'
-              shopt -s dotglob
-              mv -- "$clone_directory"/* "$root/"
-              rmdir "$clone_directory"
-              trap - EXIT
-          fi
-      fi
-      unset GITHUB_TOKEN GIT_ASKPASS GIT_TERMINAL_PROMPT
-      [[ -d "$root/$package" ]] || fail 'GO_PACKAGE does not exist or is not a directory.'
-      package_directory="$(cd "$root/$package" && pwd -P)"
-      [[ "$package_directory" == "$root" || "$package_directory" == "$root/"* ]] || fail 'GO_PACKAGE must resolve inside the server root.'
-      [[ ! -d "$root/$executable" ]] || fail 'EXECUTABLE conflicts with an existing directory.'
-      export GOPATH="$root/.cache/go" GOCACHE="$root/.cache/go-build"
-      mkdir -p "$GOPATH" "$GOCACHE"
-      go version
-      printf '[golang] Building %s -> %s...\n' "$package" "$executable"
-      build_directory="$(mktemp -d "$root/.go-build.XXXXXX")"
-      trap 'rm -rf -- "$build_directory"' EXIT
-      # Keep compiler intermediates off Wings' small /tmp tmpfs.
-      (cd "$package_directory"; GOTMPDIR="$build_directory" TMPDIR="$build_directory" go build -o "$build_directory/app" .)
-      [[ -f "$build_directory/app" && -x "$build_directory/app" ]] || fail 'GO_PACKAGE must build an executable main package.'
-      mv -fT -- "$build_directory/app" "$root/$executable"
-      rmdir "$build_directory"
-      trap - EXIT
-      printf '[golang] Launching application\n'
-      exec "$root/$executable"
-      START_SH
-      chmod 755 "$tools/start.sh" "$tools/git-askpass.sh"
+      chmod 755 "$tools/git-askpass.sh"
       echo 'Go installed. Source files will be built at startup.'
 variables:
   - sort: 1
