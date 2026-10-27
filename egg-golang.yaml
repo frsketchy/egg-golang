@@ -1,15 +1,9 @@
-meta:
-  version: PLCN_v3
-  update_url: null
+meta: {version: PLCN_v3}
 name: Golang
 uuid: a174a67d-5ba3-4d7e-a9fb-c09981c60d15
 author: cshubb
-description: >-
-  Optionally clone or pull a GitHub repository, build a local Go main package
-  into an executable in the server files root, and run it on every startup.
-  Uses the published Debian yolk and installs Go automatically.
-tags:
-  - golang
+description: Build and run a Go package on startup, with optional GitHub pulls. Go installs automatically.
+tags: [golang]
 features: []
 docker_images:
   Debian: ghcr.io/pelican-eggs/yolks:debian
@@ -18,25 +12,23 @@ startup_commands:
   Default: 'exec bash /home/container/.pelican/start.sh'
 config:
   files: {}
-  startup:
-    done: '[golang] Launching application'
+  startup: {done: '[golang] Launching application'}
   logs: {}
   stop: '^C'
 scripts:
   installation:
+    container: ghcr.io/pelican-eggs/installers:debian
+    entrypoint: bash
     script: |-
       #!/bin/bash
       set -euo pipefail
       tools=/mnt/server/.pelican
       mkdir -p "$tools"
-
       case "$(uname -m)" in
           x86_64) arch=amd64 ;;
           aarch64|arm64) arch=arm64 ;;
           *) echo 'Unsupported CPU architecture.' >&2; exit 1 ;;
       esac
-
-      echo 'Downloading the latest stable Go toolchain...'
       release="$(curl -fsSL --retry 3 'https://go.dev/dl/?mode=json' | jq -er --arg arch "$arch" '
           [.[] | select(.stable) | .files[] |
            select(.os == "linux" and .arch == $arch and .kind == "archive")][0] |
@@ -53,26 +45,16 @@ scripts:
       cat > "$tools/git-askpass.sh" <<'ASKPASS_SH'
       #!/bin/bash
       set -euo pipefail
-
       case "${1:-}" in
-          *Username*) printf '%s\n' 'x-access-token' ;;
-          *Password*)
-              [[ -n "${GITHUB_TOKEN:-}" ]] || exit 1
-              printf '%s\n' "$GITHUB_TOKEN"
-              ;;
+          *Username*) echo x-access-token ;;
+          *Password*) [[ -n "${GITHUB_TOKEN:-}" ]] && printf '%s\n' "$GITHUB_TOKEN" ;;
           *) exit 1 ;;
       esac
       ASKPASS_SH
-
       cat > "$tools/start.sh" <<'START_SH'
       #!/bin/bash
-      set -Eeuo pipefail
-
-      fail() {
-          printf '[golang] ERROR: %s\n' "$*" >&2
-          exit 1
-      }
-
+      set -euo pipefail
+      fail() { printf '[golang] ERROR: %s\n' "$*" >&2; exit 1; }
       normalize_repository() {
           local repository="${1#https://github.com/}"
           repository="${repository%/}"
@@ -80,169 +62,105 @@ scripts:
           [[ "$repository" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ ]] || return 1
           printf '%s\n' "$repository"
       }
-
       cd "${HOME:-/home/container}"
       root="$(pwd -P)"
       executable="${EXECUTABLE:-}"
       package="${GO_PACKAGE:-}"
       pull_on_startup="${PULL_ON_STARTUP:-0}"
       export PATH="$root/.pelican/go/bin:$PATH"
-
-      [[ "$executable" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
-          || fail 'EXECUTABLE must be a filename starting with a letter or digit (letters, digits, dots, underscores, and hyphens only).'
-      [[ -n "$package" && "$package" != /* ]] \
-          || fail 'GO_PACKAGE must be a directory relative to the server files root, such as . or ./cmd/server.'
-      [[ "$pull_on_startup" == 0 || "$pull_on_startup" == 1 ]] \
-          || fail 'PULL_ON_STARTUP must be 0 or 1.'
+      [[ "$executable" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail 'Invalid EXECUTABLE filename.'
+      [[ -n "$package" && "$package" != /* ]] || fail 'GO_PACKAGE must be relative to the server files root.'
+      [[ "$pull_on_startup" == 0 || "$pull_on_startup" == 1 ]] || fail 'PULL_ON_STARTUP must be 0 or 1.'
 
       if [[ "$pull_on_startup" == 1 && -n "${GITHUB_REPO:-}" ]]; then
-          repository="$(normalize_repository "$GITHUB_REPO")" \
-              || fail 'GITHUB_REPO must be owner/repository or an HTTPS github.com repository URL without credentials.'
+          repository="$(normalize_repository "$GITHUB_REPO")" || fail 'GITHUB_REPO must be owner/repo or a GitHub HTTPS URL.'
           repository_url="https://github.com/${repository}.git"
-          export GIT_TERMINAL_PROMPT=0 LC_ALL=C
-          export GIT_ASKPASS="${BASH_SOURCE[0]%/*}/git-askpass.sh"
-
+          export GIT_TERMINAL_PROMPT=0 LC_ALL=C GIT_ASKPASS="${BASH_SOURCE[0]%/*}/git-askpass.sh"
           if [[ -e .git ]]; then
-              [[ "$(git rev-parse --show-toplevel)" == "$root" ]] \
-                  || fail 'The Git working tree must be rooted in the server files root.'
+              [[ "$(git rev-parse --show-toplevel)" == "$root" ]] || fail 'Git working tree must be rooted here.'
               origin="$(git remote get-url origin)"
-              [[ "$origin" == https://github.com/* ]] \
-                  && origin_repository="$(normalize_repository "$origin")" \
-                  || fail 'The origin remote must be an HTTPS github.com URL without embedded credentials.'
-              [[ "${origin_repository,,}" == "${repository,,}" ]] \
-                  || fail 'GITHUB_REPO differs from origin. Move the existing checkout before changing repositories.'
-              git symbolic-ref --quiet HEAD >/dev/null \
-                  || fail 'Cannot pull a detached HEAD. Check out a branch first.'
+              [[ "$origin" == https://github.com/* ]] && origin_repository="$(normalize_repository "$origin")" \
+                  || fail 'The origin remote must be a GitHub HTTPS URL without credentials.'
+              [[ "${origin_repository,,}" == "${repository,,}" ]] || fail 'GITHUB_REPO differs from origin.'
+              git symbolic-ref --quiet HEAD >/dev/null || fail 'Cannot pull a detached HEAD.'
               printf '[golang] Pulling repository (fast-forward only)...\n'
               git -c credential.helper= pull --ff-only --no-rebase origin
           else
               [[ -z "$(find . -mindepth 1 -maxdepth 1 ! -name .pelican -print -quit)" ]] \
-                  || fail 'Initial clone requires an empty server files root (apart from .pelican). Upload a complete Git checkout instead, or disable pulling to build uploaded files.'
+                  || fail 'Initial clone requires an empty server files root (apart from .pelican).'
               mkdir -p "$root/.pelican"
               clone_directory="$(mktemp -d "$root/.pelican/clone.XXXXXX")"
               trap 'rm -rf -- "$clone_directory"' EXIT
               printf '[golang] Cloning repository...\n'
               git -c credential.helper= clone -- "$repository_url" "$clone_directory"
               [[ ! -e "$clone_directory/.pelican" && ! -L "$clone_directory/.pelican" ]] \
-                  || fail 'The repository must not contain .pelican; that directory is reserved for the Go toolchain.'
-              shopt -s dotglob nullglob
-              source_files=("$clone_directory"/*)
-              mv -- "${source_files[@]}" "$root/"
+                  || fail 'Repository must not contain .pelican (reserved for Go).'
+              shopt -s dotglob
+              mv -- "$clone_directory"/* "$root/"
               rmdir "$clone_directory"
               trap - EXIT
           fi
-      else
-          printf '[golang] Repository sync disabled; using local source files.\n'
       fi
-
-      # The token is for repository sync, not for the compiler or the application.
       unset GITHUB_TOKEN GIT_ASKPASS GIT_TERMINAL_PROMPT
-
       [[ -d "$root/$package" ]] || fail 'GO_PACKAGE does not exist or is not a directory.'
       package_directory="$(cd "$root/$package" && pwd -P)"
-      [[ "$package_directory" == "$root" || "$package_directory" == "$root/"* ]] \
-          || fail 'GO_PACKAGE must resolve inside the server files root.'
+      [[ "$package_directory" == "$root" || "$package_directory" == "$root/"* ]] || fail 'GO_PACKAGE must resolve inside the server root.'
       [[ ! -d "$root/$executable" ]] || fail 'EXECUTABLE conflicts with an existing directory.'
-
-      export GOPATH="$root/.cache/go"
-      export GOCACHE="$root/.cache/go-build"
+      export GOPATH="$root/.cache/go" GOCACHE="$root/.cache/go-build"
       mkdir -p "$GOPATH" "$GOCACHE"
-
       go version
       printf '[golang] Building %s -> %s...\n' "$package" "$executable"
       build_directory="$(mktemp -d "$root/.go-build.XXXXXX")"
       trap 'rm -rf -- "$build_directory"' EXIT
-      (
-          cd "$package_directory"
-          # Wings mounts /tmp as a small tmpfs; keep compiler intermediates on disk.
-          GOTMPDIR="$build_directory" TMPDIR="$build_directory" \
-              go build -o "$build_directory/app" .
-      )
-      [[ -f "$build_directory/app" && -x "$build_directory/app" ]] \
-          || fail 'GO_PACKAGE must build an executable main package.'
-
-      # Replace the binary only after a successful build; never execute a stale build.
+      # Keep compiler intermediates off Wings' small /tmp tmpfs.
+      (cd "$package_directory"; GOTMPDIR="$build_directory" TMPDIR="$build_directory" go build -o "$build_directory/app" .)
+      [[ -f "$build_directory/app" && -x "$build_directory/app" ]] || fail 'GO_PACKAGE must build an executable main package.'
       mv -fT -- "$build_directory/app" "$root/$executable"
       rmdir "$build_directory"
       trap - EXIT
       printf '[golang] Launching application\n'
       exec "$root/$executable"
       START_SH
-
       chmod 755 "$tools/start.sh" "$tools/git-askpass.sh"
       echo 'Go installed. Source files will be built at startup.'
-    container: ghcr.io/pelican-eggs/installers:debian
-    entrypoint: bash
 variables:
   - sort: 1
     name: Executable name
-    description: >-
-      Output filename in /home/container, without a path. Choose a name that does
-      not conflict with your source files or directories.
+    description: Output filename in the server root, without a path.
     env_variable: EXECUTABLE
     default_value: server
     user_viewable: true
     user_editable: true
-    rules:
-      - required
-      - string
-      - max:128
-      - 'regex:/^[A-Za-z0-9][A-Za-z0-9._-]*$/'
+    rules: [required, string, 'max:128', 'regex:/^[A-Za-z0-9][A-Za-z0-9._-]*$/']
   - sort: 2
     name: Go package directory
-    description: >-
-      Directory containing the main package, relative to /home/container.
-      Use . for the root package or ./cmd/server for a subdirectory.
-      Nested Go modules are supported. This is not a filename or import path.
+    description: 'Main-package directory relative to the server root, e.g. . or ./cmd/api.'
     env_variable: GO_PACKAGE
     default_value: '.'
     user_viewable: true
     user_editable: true
-    rules:
-      - required
-      - string
-      - max:255
+    rules: [required, string, 'max:255']
   - sort: 3
     name: GitHub repository
-    description: >-
-      Optional owner/repository or https://github.com/owner/repository.git.
-      Only used when Pull on startup is enabled. The initial clone requires an
-      empty server files root (except the generated .pelican directory);
-      subsequent starts pull the current branch.
+    description: 'Optional owner/repo or HTTPS GitHub URL. First clone needs an empty server root except .pelican.'
     env_variable: GITHUB_REPO
     default_value: ''
     user_viewable: true
     user_editable: true
-    rules:
-      - nullable
-      - string
-      - max:255
-      - 'regex:~^(https://github\.com/)?[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+/?$~'
+    rules: [nullable, string, 'max:255', 'regex:~^(https://github\.com/)?[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+/?$~']
   - sort: 4
     name: GitHub token
-    description: >-
-      Optional personal access token for a private GitHub repository. Prefer a
-      fine-grained token restricted to this repository with Contents read-only.
-      Set in the admin server startup settings. Hidden from the normal startup
-      UI, but not a secret boundary: server code can access its environment.
+    description: Optional read-only PAT for private repositories. Admin-only field; not isolated from server code.
     env_variable: GITHUB_TOKEN
     default_value: ''
     user_viewable: false
     user_editable: false
-    rules:
-      - nullable
-      - string
-      - max:512
+    rules: [nullable, string, 'max:512']
   - sort: 5
     name: Pull on startup
-    description: >-
-      Clone or fast-forward pull before building when enabled (1) and a GitHub
-      repository is configured. Disabled (0) by default. Public repositories
-      do not need a token. Pull errors stop startup without running an old binary.
+    description: Clone or fast-forward pull before building when a repository is set.
     env_variable: PULL_ON_STARTUP
     default_value: '0'
     user_viewable: true
     user_editable: true
-    rules:
-      - required
-      - boolean
+    rules: [required, boolean]
